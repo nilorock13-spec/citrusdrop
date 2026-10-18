@@ -1,306 +1,160 @@
-"""CitrusDrop: offline Windows file utility. Python 3.11+ / Tkinter."""
-from __future__ import annotations
-import os
-import queue
-import shutil
-import subprocess
-import threading
-import tkinter as tk
-from pathlib import Path
+import os, subprocess, shutil, tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageOps
+from pathlib import Path
+from PIL import Image, ImageTk, ImageOps
 from pypdf import PdfReader, PdfWriter
+from tkinterdnd2 import TkinterDnD, DND_FILES
 
-IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff'}
-VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.webm', '.avi'}
+IMAGE_EXT={'.jpg','.jpeg','.png','.webp','.bmp','.tif','.tiff'}
+VIDEO_EXT={'.mp4','.mov','.mkv','.avi','.webm'}
+BG='#10151e'; PANEL='#1d2633'; FG='#f3f6fa'; MUTED='#a8b6c7'; ACCENT='#ffad53'
 
-def unique_path(folder: Path, stem: str, ext: str) -> Path:
-    folder.mkdir(parents=True, exist_ok=True)
-    dest = folder / (stem + ext)
-    index = 2
-    while dest.exists():
-        dest = folder / f'{stem}_{index}{ext}'
-        index += 1
-    return dest
-
-def ffmpeg_path() -> str:
-    executable = shutil.which('ffmpeg')
-    if not executable:
-        raise RuntimeError('FFmpeg is missing. Install it and add ffmpeg to PATH, then restart the app.')
-    return executable
-
-def image_process(path: Path, output: Path, action: str, fmt: str, width: int, height: int, quality: int):
-    with Image.open(path) as source:
-        image = ImageOps.exif_transpose(source)
-        if action == 'Resize':
-            if width < 1 or height < 1:
-                raise ValueError('Width and height must be positive.')
-            image.thumbnail((width, height), Image.Resampling.LANCZOS)
-        elif action == 'Center crop':
-            if width < 1 or height < 1 or width > image.width or height > image.height:
-                raise ValueError(f'Crop size must be within {image.width} × {image.height} pixels.')
-            left = (image.width - width) // 2
-            top = (image.height - height) // 2
-            image = image.crop((left, top, left + width, top + height))
-        elif action == 'Rotate 90°':
-            image = image.rotate(-90, expand=True)
-        elif action not in ('Convert', 'Compress'):
-            raise ValueError('Unsupported image operation.')
-        if fmt == 'JPEG':
-            if image.mode not in ('RGB', 'L'):
-                background = Image.new('RGB', image.size, 'white')
-                if 'A' in image.getbands():
-                    background.paste(image, mask=image.getchannel('A'))
-                else:
-                    background.paste(image.convert('RGB'))
-                image = background
-            image.save(output, format='JPEG', quality=quality, optimize=True)
-        elif fmt == 'PNG':
-            image.save(output, format='PNG', optimize=True)
-        elif fmt == 'WEBP':
-            image.save(output, format='WEBP', quality=quality, method=5)
-        else:
-            raise ValueError('Unsupported image format.')
-
-def pdf_process(paths: list[Path], folder: Path, action: str, degrees: int):
-    outputs = []
-    if action == 'Merge':
-        writer = PdfWriter()
-        for path in paths:
-            writer.append(str(path))
-        dest = unique_path(folder, 'merged', '.pdf')
-        with dest.open('wb') as stream:
-            writer.write(stream)
-        writer.close()
-        return [dest]
-    for path in paths:
-        reader = PdfReader(str(path))
-        if reader.is_encrypted:
-            raise ValueError(f'{path.name} is encrypted. Unlock it first.')
-        if action == 'Rotate':
-            writer = PdfWriter()
-            for page in reader.pages:
-                writer.add_page(page.rotate(degrees))
-            dest = unique_path(folder, path.stem + '_rotated', '.pdf')
-            with dest.open('wb') as stream:
-                writer.write(stream)
-            writer.close()
-            outputs.append(dest)
-        elif action == 'Split pages':
-            for n, page in enumerate(reader.pages, start=1):
-                writer = PdfWriter()
-                writer.add_page(page)
-                dest = unique_path(folder, f'{path.stem}_page_{n:03d}', '.pdf')
-                with dest.open('wb') as stream:
-                    writer.write(stream)
-                writer.close()
-                outputs.append(dest)
-        else:
-            raise ValueError('Unsupported PDF operation.')
-    return outputs
-
-def video_process(path: Path, dest: Path, action: str, start: float, duration: float, crf: int):
-    cmd = [ffmpeg_path(), '-hide_banner', '-loglevel', 'error', '-nostdin', '-n']
-    if action == 'Trim':
-        if start < 0 or duration <= 0:
-            raise ValueError('Start must be ≥ 0 and duration > 0.')
-        cmd += ['-ss', str(start), '-i', str(path), '-t', str(duration)]
-    else:
-        cmd += ['-i', str(path)]
-    cmd += ['-map', '0:v:0', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'medium', '-crf', str(crf),
-            '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', str(dest)]
-    result = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-    if result.returncode:
-        raise RuntimeError(result.stderr[-1800:] or 'FFmpeg failed.')
-
-class App(tk.Tk):
+class App:
     def __init__(self):
-        super().__init__()
-        self.title('CitrusDrop — Offline File Toolkit')
-        self.geometry('850x680')
-        self.minsize(690, 570)
-        self.files: list[Path] = []
-        self.events: queue.Queue = queue.Queue()
-        self.busy = False
-        self.output = tk.StringVar(value=str(Path.home() / 'Documents' / 'CitrusDrop Output'))
-        self.image_action = tk.StringVar(value='Convert')
-        self.image_format = tk.StringVar(value='PNG')
-        self.img_width = tk.StringVar(value='800')
-        self.img_height = tk.StringVar(value='800')
-        self.quality = tk.StringVar(value='80')
-        self.pdf_action = tk.StringVar(value='Merge')
-        self.degrees = tk.StringVar(value='90')
-        self.video_action = tk.StringVar(value='Convert / Compress')
-        self.start = tk.StringVar(value='0')
-        self.duration = tk.StringVar(value='10')
-        self.crf = tk.StringVar(value='25')
-        self.build_ui()
-        self.after(120, self.poll)
-
-    def build_ui(self):
-        ttk.Style().theme_use('clam')
-        container = ttk.Frame(self, padding=16)
-        container.pack(fill='both', expand=True)
-        ttk.Label(container, text='🍊 CitrusDrop', font=('Segoe UI', 21, 'bold')).pack(anchor='w')
-        ttk.Label(container, text='Local-first file tools • Nothing is uploaded').pack(anchor='w', pady=(0, 12))
-        buttons = ttk.Frame(container)
-        buttons.pack(fill='x')
-        ttk.Button(buttons, text='Add files', command=self.add_files).pack(side='left', padx=(0, 7))
-        ttk.Button(buttons, text='Remove selected', command=self.remove_selected).pack(side='left', padx=(0, 7))
-        ttk.Button(buttons, text='Clear', command=self.clear_files).pack(side='left')
-        self.listbox = tk.Listbox(container, height=9, selectmode='extended', font=('Segoe UI', 10))
-        self.listbox.pack(fill='both', expand=True, pady=(9, 12))
-        out = ttk.Frame(container)
-        out.pack(fill='x', pady=(0, 12))
-        ttk.Label(out, text='Output folder').pack(side='left', padx=(0, 8))
-        ttk.Entry(out, textvariable=self.output).pack(side='left', fill='x', expand=True)
-        ttk.Button(out, text='Browse', command=self.browse_output).pack(side='left', padx=(8, 0))
-        self.tabs = ttk.Notebook(container)
-        self.tabs.pack(fill='x')
-        self.tab_image = ttk.Frame(self.tabs, padding=12)
-        self.tab_pdf = ttk.Frame(self.tabs, padding=12)
-        self.tab_video = ttk.Frame(self.tabs, padding=12)
-        self.tabs.add(self.tab_image, text='Images')
-        self.tabs.add(self.tab_pdf, text='PDF')
-        self.tabs.add(self.tab_video, text='Video')
-        self.make_row(self.tab_image, 0, 'Action', self.image_action, ['Convert', 'Compress', 'Resize', 'Center crop', 'Rotate 90°'])
-        self.make_row(self.tab_image, 1, 'Output format', self.image_format, ['PNG', 'JPEG', 'WEBP'])
-        self.make_entry(self.tab_image, 2, 'Width (px)', self.img_width)
-        self.make_entry(self.tab_image, 3, 'Height (px)', self.img_height)
-        self.make_entry(self.tab_image, 4, 'Quality 1–100', self.quality)
-        ttk.Label(self.tab_image, text='Resize preserves aspect ratio. Crop takes the center region.').grid(row=5, column=0, columnspan=2, sticky='w', pady=4)
-        self.make_row(self.tab_pdf, 0, 'Action', self.pdf_action, ['Merge', 'Split pages', 'Rotate'])
-        self.make_row(self.tab_pdf, 1, 'Rotation', self.degrees, ['90', '180', '270'])
-        ttk.Label(self.tab_pdf, text='Merge uses file-list order; split exports every page separately.').grid(row=2, column=0, columnspan=2, sticky='w', pady=8)
-        self.make_row(self.tab_video, 0, 'Action', self.video_action, ['Convert / Compress', 'Trim'])
-        self.make_entry(self.tab_video, 1, 'Start (seconds)', self.start)
-        self.make_entry(self.tab_video, 2, 'Duration (seconds)', self.duration)
-        self.make_entry(self.tab_video, 3, 'CRF quality 18–35', self.crf)
-        ttk.Label(self.tab_video, text='Requires FFmpeg on PATH. Outputs H.264/AAC MP4. Lower CRF = higher quality.').grid(row=4, column=0, columnspan=2, sticky='w', pady=8)
-        bottom = ttk.Frame(container)
-        bottom.pack(fill='x', pady=(14, 0))
-        self.run_button = ttk.Button(bottom, text='Process selected tab', command=self.start_job)
-        self.run_button.pack(side='left')
-        self.status = ttk.Label(bottom, text='Ready')
-        self.status.pack(side='left', padx=12)
-        self.progress = ttk.Progressbar(container, mode='indeterminate')
-        self.progress.pack(fill='x', pady=(8, 0))
-
-    def make_row(self, parent, row, label, var, choices):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky='w', padx=(0, 14), pady=3)
-        ttk.Combobox(parent, textvariable=var, values=choices, state='readonly', width=25).grid(row=row, column=1, sticky='w', pady=3)
-
-    def make_entry(self, parent, row, label, var):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky='w', padx=(0, 14), pady=3)
-        ttk.Entry(parent, textvariable=var, width=27).grid(row=row, column=1, sticky='w', pady=3)
-
-    def add_files(self):
-        for name in filedialog.askopenfilenames(title='Choose files'):
-            path = Path(name)
-            if path not in self.files:
-                self.files.append(path)
-                self.listbox.insert('end', str(path))
-
-    def remove_selected(self):
-        for index in reversed(self.listbox.curselection()):
-            self.listbox.delete(index)
-            del self.files[index]
-
-    def clear_files(self):
-        self.files.clear()
-        self.listbox.delete(0, 'end')
-
-    def browse_output(self):
-        folder = filedialog.askdirectory()
-        if folder:
-            self.output.set(folder)
-
-    def start_job(self):
-        if self.busy:
-            return
-        tab = self.tabs.index(self.tabs.select())
-        selected = [self.files[i] for i in self.listbox.curselection()] or list(self.files)
-        if not selected:
-            messagebox.showwarning('No files', 'Add at least one file first.')
-            return
+        self.root=TkinterDnD.Tk(); self.root.title('CitrusDrop — Drop. Edit. Done.'); self.root.geometry('1040x750'); self.root.minsize(740,560); self.root.configure(bg=BG)
+        self.path=None; self.image=None; self.preview=None; self.scale=1; self.offset=(0,0); self.start=None; self.selection=None; self.rect=None
+        tk.Label(self.root,text='●  CitrusDrop',bg=BG,fg=ACCENT,font=('Segoe UI',24,'bold')).pack(anchor='w',padx=30,pady=(22,0))
+        tk.Label(self.root,text='Drop a photo, PDF or video. Pick a tool. Save.',bg=BG,fg=MUTED,font=('Segoe UI',11)).pack(anchor='w',padx=32,pady=(0,15))
+        top=tk.Frame(self.root,bg=PANEL,highlightbackground='#3c4b5e',highlightthickness=1); top.pack(fill='x',padx=30,pady=6)
+        self.drop=tk.Label(top,text='↓   Drag files here   •   or click to browse',bg=PANEL,fg=FG,font=('Segoe UI',14),height=3,cursor='hand2'); self.drop.pack(fill='x'); self.drop.bind('<Button-1>',lambda e:self.browse())
+        for w in (self.root,top,self.drop): w.drop_target_register(DND_FILES); w.dnd_bind('<<Drop>>',self.dropped)
+        self.file_label=tk.Label(self.root,text='No file selected',bg=BG,fg=MUTED,font=('Segoe UI',10)); self.file_label.pack(anchor='w',padx=32,pady=(12,6))
+        self.toolbar=tk.Frame(self.root,bg=BG); self.toolbar.pack(fill='x',padx=28,pady=(0,9))
+        self.buttons=[]
+        for title,fn in [('Crop photo',self.crop_mode),('Resize',self.resize),('Convert',self.convert),('Compress',self.compress),('Rotate ↻',self.rotate),('PDF tools',self.pdf_tools),('Trim video',self.trim_video)]:
+            b=tk.Button(self.toolbar,text=title,command=fn,bg=PANEL,fg=FG,activebackground='#35445a',activeforeground=FG,relief='flat',font=('Segoe UI',10),padx=11,pady=9,cursor='hand2'); b.pack(side='left',padx=3); self.buttons.append(b)
+        self.canvas=tk.Canvas(self.root,bg='#161e29',highlightthickness=0,cursor='crosshair'); self.canvas.pack(fill='both',expand=True,padx=30,pady=(0,8)); self.canvas.bind('<Configure>',lambda e:self.render()); self.canvas.bind('<ButtonPress-1>',self.mouse_down); self.canvas.bind('<B1-Motion>',self.mouse_drag); self.canvas.bind('<ButtonRelease-1>',self.mouse_up)
+        bottom=tk.Frame(self.root,bg=BG); bottom.pack(fill='x',padx=30,pady=(0,20))
+        self.hint=tk.Label(bottom,text='Drop an image to preview it here.',bg=BG,fg=MUTED,font=('Segoe UI',10)); self.hint.pack(side='left')
+        tk.Button(bottom,text='Crop & Save',command=self.save_crop,bg=ACCENT,fg='#111111',relief='flat',font=('Segoe UI',11,'bold'),padx=18,pady=10).pack(side='right')
+        self.crop_active=True; self.render()
+    def dropped(self,event):
+        paths=self.root.tk.splitlist(event.data)
+        if paths:self.open_file(paths[0])
+    def browse(self):
+        p=filedialog.askopenfilename(filetypes=[('Supported files','*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff *.pdf *.mp4 *.mov *.mkv *.avi *.webm'),('All files','*.*')]);
+        if p:self.open_file(p)
+    def open_file(self,p):
+        self.path=Path(p); self.file_label.config(text=self.path.name); self.selection=None
         try:
-            folder = Path(self.output.get()).expanduser().resolve()
-            if tab == 0:
-                action, fmt = self.image_action.get(), self.image_format.get()
-                width, height, quality = int(self.img_width.get()), int(self.img_height.get()), int(self.quality.get())
-                if not 1 <= quality <= 100:
-                    raise ValueError('Quality must be 1–100.')
-                args = (action, fmt, width, height, quality)
-            elif tab == 1:
-                args = (self.pdf_action.get(), int(self.degrees.get()))
+            self.image=ImageOps.exif_transpose(Image.open(p)).copy() if self.path.suffix.lower() in IMAGE_EXT else None
+        except Exception as e:self.image=None;messagebox.showerror('Cannot open image',str(e))
+        self.hint.config(text='Drag a rectangle over the photo, then click Crop & Save.' if self.image else 'Choose a PDF or video tool above.'); self.render()
+    def render(self):
+        if not hasattr(self,'canvas'):return
+        c=self.canvas;c.delete('all'); w=max(100,c.winfo_width());h=max(100,c.winfo_height())
+        if self.image:
+            iw,ih=self.image.size; self.scale=min((w-30)/iw,(h-30)/ih,1); pw=max(1,int(iw*self.scale));ph=max(1,int(ih*self.scale));self.offset=((w-pw)//2,(h-ph)//2)
+            display=self.image.convert('RGB').resize((pw,ph),Image.Resampling.LANCZOS);self.preview=ImageTk.PhotoImage(display);c.create_image(*self.offset,image=self.preview,anchor='nw')
+            if self.selection:self.draw_selection()
+        else:
+            c.create_text(w/2,h/2,text='Your preview appears here\n\nDrag a photo into the window to begin',fill=MUTED,font=('Segoe UI',17),justify='center')
+    def coords(self,x,y):
+        if not self.image:return (0,0)
+        ox,oy=self.offset; iw,ih=self.image.size
+        return (max(0,min(iw,round((x-ox)/self.scale))),max(0,min(ih,round((y-oy)/self.scale))))
+    def mouse_down(self,e):
+        if self.image and self.crop_active:self.start=self.coords(e.x,e.y);self.selection=None
+    def mouse_drag(self,e):
+        if self.start:self.selection=(*self.start,*self.coords(e.x,e.y));self.draw_selection()
+    def mouse_up(self,e):
+        if self.start:self.selection=(*self.start,*self.coords(e.x,e.y));self.start=None;self.draw_selection()
+    def draw_selection(self):
+        c=self.canvas;c.delete('cropbox')
+        if not self.selection:return
+        x1,y1,x2,y2=self.selection;ox,oy=self.offset
+        c.create_rectangle(ox+x1*self.scale,oy+y1*self.scale,ox+x2*self.scale,oy+y2*self.scale,outline=ACCENT,width=3,dash=(7,3),tags='cropbox')
+    def image_required(self):
+        if not self.image:messagebox.showinfo('Choose a photo','Drop or open a photo first.');return False
+        return True
+    def crop_mode(self):
+        if self.image_required():self.crop_active=True;self.hint.config(text='Drag across the photo to select the area to keep.')
+    def save_image(self,img,suffix='_edited',fmt=None,quality=90):
+        if not self.path:return
+        ext=('.'+fmt.lower().replace('jpeg','jpg')) if fmt else self.path.suffix.lower()
+        if ext not in IMAGE_EXT:ext='.png'
+        p=filedialog.asksaveasfilename(defaultextension=ext,initialfile=self.path.stem+suffix+ext,filetypes=[('Image',f'*{ext}'),('All files','*.*')]);
+        if not p:return
+        try:
+            output=img.convert('RGB') if Path(p).suffix.lower() in ('.jpg','.jpeg') else img
+            output.save(p,quality=quality,optimize=True);self.hint.config(text='Saved: '+p);messagebox.showinfo('Saved','Saved successfully!')
+        except Exception as e:messagebox.showerror('Save failed',str(e))
+    def save_crop(self):
+        if not self.image_required():return
+        if not self.selection:messagebox.showinfo('Select an area','Click and drag over the photo to select what you want to keep.');return
+        x1,y1,x2,y2=self.selection;box=(min(x1,x2),min(y1,y2),max(x1,x2),max(y1,y2))
+        if box[2]-box[0]<2 or box[3]-box[1]<2:messagebox.showwarning('Selection too small','Please select a larger area.');return
+        self.save_image(self.image.crop(box),'_cropped')
+    def ask_values(self,title,fields,defaults):
+        dlg=tk.Toplevel(self.root);dlg.title(title);dlg.configure(bg=BG);dlg.resizable(False,False);dlg.transient(self.root);dlg.grab_set();values=[];entries=[]
+        for i,(label,default) in enumerate(zip(fields,defaults)):
+            tk.Label(dlg,text=label,bg=BG,fg=FG).grid(row=i,column=0,padx=16,pady=9,sticky='w');e=tk.Entry(dlg,width=25);e.insert(0,str(default));e.grid(row=i,column=1,padx=16,pady=9);entries.append(e)
+        def done():values.extend(e.get() for e in entries);dlg.destroy()
+        tk.Button(dlg,text='Continue',command=done,bg=ACCENT,fg='black').grid(row=len(fields),columnspan=2,pady=14);self.root.wait_window(dlg);return values or None
+    def resize(self):
+        if not self.image_required():return
+        vals=self.ask_values('Resize photo',['Width (pixels)','Height (pixels)'],self.image.size)
+        if vals:
+            try:
+                w,h=map(int,vals);assert 0<w<=20000 and 0<h<=20000;self.save_image(self.image.resize((w,h),Image.Resampling.LANCZOS),'_resized')
+            except (ValueError,AssertionError):messagebox.showerror('Invalid dimensions','Enter positive dimensions up to 20,000 pixels.')
+    def convert(self):
+        if not self.image_required():return
+        vals=self.ask_values('Convert photo',['Format: JPG, PNG or WEBP'],['PNG'])
+        if vals:
+            fmt=vals[0].strip().upper().replace('JPG','JPEG')
+            if fmt not in ('JPEG','PNG','WEBP'):messagebox.showerror('Format','Choose JPG, PNG or WEBP.');return
+            self.save_image(self.image,'_converted',fmt)
+    def compress(self):
+        if not self.image_required():return
+        vals=self.ask_values('Compress photo',['Quality (1–95, lower = smaller)'],[65])
+        if vals:
+            try:
+                q=int(vals[0]);assert 1<=q<=95;self.save_image(self.image.convert('RGB'),'_compressed','JPEG',q)
+            except (ValueError,AssertionError):messagebox.showerror('Quality','Enter a number between 1 and 95.')
+    def rotate(self):
+        if self.image_required():self.image=self.image.rotate(-90,expand=True);self.selection=None;self.render();self.hint.config(text='Rotated preview. Use Convert to save it.')
+    def pdf_tools(self):
+        vals=self.ask_values('PDF tools',['Action: merge, split, rotate'],['merge'])
+        if not vals:return
+        action=vals[0].strip().lower()
+        try:
+            if action=='merge':
+                paths=filedialog.askopenfilenames(filetypes=[('PDF','*.pdf')]);
+                if len(paths)<2:return
+                writer=PdfWriter()
+                for p in paths:writer.append(p)
             else:
-                start, duration, crf = float(self.start.get()), float(self.duration.get()), int(self.crf.get())
-                if not 18 <= crf <= 35:
-                    raise ValueError('CRF must be between 18 and 35.')
-                args = (self.video_action.get(), start, duration, crf)
-        except ValueError as error:
-            messagebox.showerror('Invalid settings', str(error))
-            return
-        self.busy = True
-        self.run_button.configure(state='disabled')
-        self.progress.start(12)
-        self.status.configure(text='Processing…')
-        threading.Thread(target=self.worker, args=(tab, selected, folder, args), daemon=True).start()
-
-    def worker(self, tab, selected, folder, args):
-        count = 0
-        failures = []
+                p=str(self.path) if self.path and self.path.suffix.lower()=='.pdf' else filedialog.askopenfilename(filetypes=[('PDF','*.pdf')]);
+                if not p:return
+                reader=PdfReader(p);writer=PdfWriter()
+                if action=='split':
+                    n=self.ask_values('Extract pages',['Page range, e.g. 1-3'],['1-1']);
+                    if not n:return
+                    a,b=map(int,n[0].split('-'))
+                    if a<1 or b>len(reader.pages) or a>b:raise ValueError('Invalid page range')
+                    for i in range(a-1,b):writer.add_page(reader.pages[i])
+                elif action=='rotate':
+                    for page in reader.pages:writer.add_page(page.rotate(90))
+                else:messagebox.showinfo('PDF tools','Choose merge, split or rotate.');return
+            out=filedialog.asksaveasfilename(defaultextension='.pdf',filetypes=[('PDF','*.pdf')],initialfile='CitrusDrop_output.pdf')
+            if out:
+                with open(out,'wb') as f:writer.write(f)
+                messagebox.showinfo('Saved','PDF saved successfully.')
+        except Exception as e:messagebox.showerror('PDF error',str(e))
+    def trim_video(self):
+        if not self.path or self.path.suffix.lower() not in VIDEO_EXT:messagebox.showinfo('Choose video','Drop a video file first.');return
+        ffmpeg=shutil.which('ffmpeg')
+        if not ffmpeg:messagebox.showinfo('FFmpeg required','Install FFmpeg and add it to PATH to enable video trimming.');return
+        vals=self.ask_values('Trim video',['Start time (seconds)','Duration (seconds)'],[0,10]);
+        if not vals:return
         try:
-            folder.mkdir(parents=True, exist_ok=True)
-            valid_exts = [IMAGE_EXTS, {'.pdf'}, VIDEO_EXTS][tab]
-            selected = [p for p in selected if p.suffix.lower() in valid_exts]
-            if not selected:
-                raise ValueError('No supported files for the selected tab.')
-            if tab == 1 and args[0] == 'Merge':
-                pdf_process(selected, folder, *args)
-                count = 1
-            else:
-                for path in selected:
-                    try:
-                        if tab == 0:
-                            action, fmt, width, height, quality = args
-                            ext = {'PNG': '.png', 'JPEG': '.jpg', 'WEBP': '.webp'}[fmt]
-                            dest = unique_path(folder, path.stem + '_' + action.lower().replace(' ', '_'), ext)
-                            image_process(path, dest, *args)
-                        elif tab == 1:
-                            results = pdf_process([path], folder, *args)
-                            count += len(results) - 1
-                        else:
-                            action, start, duration, crf = args
-                            dest = unique_path(folder, path.stem + ('_trimmed' if action == 'Trim' else '_converted'), '.mp4')
-                            video_process(path, dest, *args)
-                        count += 1
-                    except Exception as error:
-                        failures.append(f'{path.name}: {error}')
-            self.events.put(('done', count, failures, str(folder)))
-        except Exception as error:
-            self.events.put(('error', str(error)))
+            start=float(vals[0]);duration=float(vals[1]);assert start>=0 and duration>0
+            out=filedialog.asksaveasfilename(defaultextension='.mp4',initialfile=self.path.stem+'_trimmed.mp4',filetypes=[('MP4','*.mp4')]);
+            if out:
+                subprocess.run([ffmpeg,'-y','-ss',str(start),'-i',str(self.path),'-t',str(duration),'-c:v','libx264','-crf','23','-c:a','aac',out],check=True,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0));messagebox.showinfo('Saved','Video saved successfully.')
+        except (ValueError,AssertionError):messagebox.showerror('Invalid time','Enter a valid start time and duration.')
+        except subprocess.CalledProcessError:messagebox.showerror('FFmpeg error','Could not process video. Check that the file is supported.')
 
-    def poll(self):
-        try:
-            while True:
-                event = self.events.get_nowait()
-                self.busy = False
-                self.progress.stop()
-                self.run_button.configure(state='normal')
-                if event[0] == 'done':
-                    _, count, failures, folder = event
-                    self.status.configure(text=f'{count} output file(s) created')
-                    details = f'Created {count} file(s) in:\n{folder}'
-                    if failures:
-                        details += '\n\nFailures:\n' + '\n'.join(failures[:10])
-                    (messagebox.showwarning if failures else messagebox.showinfo)('Processing finished', details)
-                else:
-                    self.status.configure(text='Failed')
-                    messagebox.showerror('Processing failed', event[1])
-        except queue.Empty:
-            pass
-        self.after(120, self.poll)
-
-if __name__ == '__main__':
-    App().mainloop()
+if __name__=='__main__':
+    App().root.mainloop()
