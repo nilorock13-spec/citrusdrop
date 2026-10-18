@@ -1,33 +1,22 @@
-
-name: Build portable Windows app
-
+name: Build CitrusDrop v2 Windows
 on:
   workflow_dispatch:
-
 jobs:
-  windows:
+  build:
     runs-on: windows-latest
-
     steps:
-      - name: Download project
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Install dependencies
+      - name: Install
         run: |
-          python -m pip install -r requirements.txt
-          python -m pip install pyinstaller
-
-      - name: Build Windows EXE
+          python -m pip install -r requirements.txt pyinstaller
+      - name: Build drag and drop desktop EXE
         run: |
-          python -m PyInstaller --onefile --windowed --name CitrusDrop app.py
-
-      - name: Upload Windows app
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all tkinterdnd2 --name CitrusDrop app.py
+      - name: Upload portable executable
         uses: actions/upload-artifact@v4
         with:
-          name: CitrusDrop-Windows
+          name: CitrusDrop-v2-Windows
           path: dist/CitrusDrop.exe
